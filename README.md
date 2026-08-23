@@ -187,6 +187,19 @@ This uses the AppImage's built-in `--appimage-extract` mode and runs its
 [official AppImage FUSE troubleshooting guide](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
 for additional background.
 
+**`Could not load the Qt platform plugin "xcb"` on Fedora**
+
+The dependency check includes the X11/XCB bridge, keyboard, and utility
+libraries required by Qt. Update the script and run it normally so it can
+offer to install anything missing, or install the Fedora packages directly:
+
+```bash
+sudo dnf install libX11-xcb libxkbcommon-x11 xcb-util
+```
+
+The remaining XCB helper libraries are already part of the standard dependency
+set installed by this script.
+
 **Resolve cannot see the GPU**
 
 Review the final GPU/OpenCL section. Confirm that the correct proprietary or
