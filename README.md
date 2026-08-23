@@ -20,6 +20,7 @@ installation, compatibility cleanup, and a quick GPU/OpenCL check.
 │  ✓ apr
 │  ✓ fuse-libs
 │  ✓ glib2
+│  ✓ xhost
 │  ✓ clinfo
 │  ✓ All dependencies are installed.
 ├─ Finding installer
@@ -29,21 +30,25 @@ installation, compatibility cleanup, and a quick GPU/OpenCL check.
 │  › Extracting ZIP into: .davinci-resolve-extract-...
 ├─ Installing DaVinci Resolve Studio
 │  › Running the official installer with SKIP_PACKAGE_CHECK=1
+│  › Temporarily granting root access to the X11/XWayland display
+│  › Revoking temporary root display access
 ╰─ ✓ DONE · launch with /opt/resolve/bin/resolve
 ```
 
 ## What it does
 
 1. Detects `apt`, `dnf`, or `pacman`.
-2. Checks the required FUSE 2, runtime, XCB, audio, and OpenCL packages.
+2. Checks the required FUSE 2, runtime, XCB, audio, OpenCL, and display packages.
 3. Asks before installing any missing dependencies with elevated privileges.
 4. Recursively finds the newest Resolve `.zip` or `.run` in `~/Downloads`.
 5. Detects whether the build is Resolve Free or Resolve Studio.
-6. Extracts the `.run`, makes it executable, and starts the official installer.
-7. Falls back to extracting the AppImage when FUSE cannot mount it.
-8. Moves incompatible bundled glib libraries into a timestamped backup.
-9. Moves downloaded installers and extraction folders to Trash.
-10. Prints a compact NVIDIA and OpenCL report.
+6. Installs XWayland when the current desktop session needs it.
+7. Opens the root installer on X11/XWayland with a temporary, user-scoped grant.
+8. Extracts the `.run`, makes it executable, and starts the official installer.
+9. Falls back to extracting the AppImage when FUSE cannot mount it.
+10. Moves incompatible bundled glib libraries into a timestamped backup.
+11. Moves downloaded installers and extraction folders to Trash.
+12. Prints a compact NVIDIA and OpenCL report.
 
 The script does **not** download or redistribute DaVinci Resolve. Download the
 Linux installer directly from Blackmagic Design, then place it in
@@ -58,6 +63,9 @@ gh repo clone donutinit/install-resolve
 cd install-resolve
 ./install-resolve
 ```
+
+Run it as your regular desktop user. Do not prefix the script with `sudo`; it
+requests elevation only for the operations that need it.
 
 Or download only the script:
 
@@ -122,16 +130,17 @@ Examples:
 
 ## Supported systems
 
-| Package manager | Distribution family | FUSE 2 package | Dependency command |
-| --- | --- | --- | --- |
-| `apt` | Debian, Ubuntu, and derivatives | `libfuse2t64` or `libfuse2` | `apt-get install` |
-| `dnf` | Fedora and derivatives | `fuse` + `fuse-libs` | `dnf install` |
-| `pacman` | Arch Linux and derivatives | `fuse2` | `pacman -S --needed` |
+| Package manager | Distribution family | FUSE 2 package | Wayland bridge | Dependency command |
+| --- | --- | --- | --- | --- |
+| `apt` | Debian, Ubuntu, and derivatives | `libfuse2t64` or `libfuse2` | `xwayland` | `apt-get install` |
+| `dnf` | Fedora and derivatives | `fuse` + `fuse-libs` | `xorg-x11-server-Xwayland` | `dnf install` |
+| `pacman` | Arch Linux and derivatives | `fuse2` | `xorg-xwayland` | `pacman -S --needed` |
 
 Requirements:
 
 - Linux and Python 3.8 or newer
-- `sudo`, unless running as root
+- `sudo`; launch the script as the regular graphical-session user
+- An X11 session or XWayland inside a Wayland session
 - FUSE 2 for the normal AppImage path; the script installs it when available
 - `gio`, `trash-put`, or `trash` for safe download cleanup
 - An official Linux build of Resolve Free or Resolve Studio
@@ -143,6 +152,13 @@ No third-party Python packages are required.
 - Missing system packages are installed only after an explicit `[y/N]` prompt.
 - The official Blackmagic Design installer remains interactive.
 - The script passes `SKIP_PACKAGE_CHECK=1` only after handling dependencies itself.
+- Qt is directed to the `xcb` backend because Resolve's Linux installer does
+  not ship a native Wayland platform plugin.
+- Before elevation, the script temporarily runs
+  `xhost +si:localuser:root`. This grants display access only to the local
+  `root` user, not to every local or remote client. The grant is revoked in a
+  `finally` block even when the installer exits with an error. A grant that
+  already existed is left unchanged.
 - When FUSE is unavailable, the fallback extracts into a temporary directory,
   runs `squashfs-root/AppRun`, and removes the temporary files afterward.
 - Bundled glib files are moved, never deleted, to
@@ -187,7 +203,30 @@ This uses the AppImage's built-in `--appimage-extract` mode and runs its
 [official AppImage FUSE troubleshooting guide](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
 for additional background.
 
-**`Could not load the Qt platform plugin "xcb"` on Fedora**
+**`qt.qpa.xcb: could not connect to display :0` on Wayland**
+
+This message means Qt found the `xcb` plugin, but the elevated installer was
+not authorized to connect to the XWayland display. It is different from a
+missing XCB library.
+
+Update the repository and run the script as your regular desktop user, without
+`sudo`:
+
+```bash
+git pull --ff-only
+./install-resolve
+```
+
+On Fedora Wayland, the dependency pass includes `xhost` and
+`xorg-x11-server-Xwayland`. The script preserves `DISPLAY` and `XAUTHORITY`,
+selects `QT_QPA_PLATFORM=xcb`, grants only the local `root` user temporary
+display access, and revokes that grant when the installer closes.
+
+If the script says that no `DISPLAY` is available, launch it from a terminal
+opened inside the graphical desktop instead of a TTY, SSH session, or root
+shell.
+
+**`Could not load the Qt platform plugin "xcb"` without a display error**
 
 The dependency check includes the X11/XCB bridge, keyboard, and utility
 libraries required by Qt. Update the script and run it normally so it can

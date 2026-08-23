@@ -112,6 +112,7 @@ APT_FIXED = [
     "libxcb-damage0",
     "libxcb-xinerama0",
     "libxcb-xinput0",
+    "x11-xserver-utils",
     "ocl-icd-opencl-dev",
     "clinfo",
 ]
@@ -133,6 +134,7 @@ DNF_PKGS = [
     "xcb-util-keysyms",
     "xcb-util-renderutil",
     "xcb-util-wm",
+    "xhost",
     "ocl-icd",
     "clinfo",
 ]
@@ -149,9 +151,16 @@ PACMAN_PKGS = [
     "xcb-util-keysyms",
     "xcb-util-renderutil",
     "xcb-util-wm",
+    "xorg-xhost",
     "opencl-icd-loader",
     "clinfo",
 ]
+
+WAYLAND_PKGS = {
+    "apt": "xwayland",
+    "dnf": "xorg-x11-server-Xwayland",
+    "pacman": "xorg-xwayland",
+}
 
 
 def q(x):
@@ -231,6 +240,30 @@ def resolve_apt_pkgs():
     return pkgs
 
 
+def is_wayland_session():
+    return (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+
+def packages_for(pm):
+    if pm == "apt":
+        pkgs = resolve_apt_pkgs()
+    elif pm == "dnf":
+        pkgs = list(DNF_PKGS)
+    elif pm == "pacman":
+        pkgs = list(PACMAN_PKGS)
+    else:
+        return []
+
+    if is_wayland_session():
+        wayland_pkg = WAYLAND_PKGS[pm]
+        if pm != "apt" or apt_pkg_available(wayland_pkg):
+            pkgs.append(wayland_pkg)
+    return pkgs
+
+
 def dependency_install_cmd(pm, missing):
     if pm == "apt":
         return sudo() + ["apt-get", "install", "-y", *missing]
@@ -272,14 +305,7 @@ def report_deps():
 
     info(f"Package manager: {paint(pm, C.BOLD, C.CYAN)}")
 
-    if pm == "apt":
-        pkgs = resolve_apt_pkgs()
-    elif pm == "dnf":
-        pkgs = DNF_PKGS
-    elif pm == "pacman":
-        pkgs = PACMAN_PKGS
-    else:
-        pkgs = []
+    pkgs = packages_for(pm)
 
     missing = [p for p in pkgs if not pkg_installed(pm, p)]
 
@@ -413,13 +439,74 @@ def fuse2_ready():
     return True
 
 
+def installer_display_env():
+    values = ["SKIP_PACKAGE_CHECK=1", "QT_QPA_PLATFORM=xcb"]
+    for name in ("DISPLAY", "XAUTHORITY"):
+        value = os.environ.get(name)
+        if value:
+            values.append(f"{name}={value}")
+    return values
+
+
 def installer_command(runfile):
     return sudo() + [
         "env",
-        "SKIP_PACKAGE_CHECK=1",
+        *installer_display_env(),
         str(runfile),
         "-i",
     ]
+
+
+def root_display_is_authorized():
+    result = out(["xhost"])
+    if not result or result.returncode != 0:
+        detail = ""
+        if result:
+            detail = (result.stderr or result.stdout).strip()
+        die(
+            "Could not access the X11/XWayland display with xhost. "
+            + (detail or "Run this script from a terminal inside your desktop session.")
+        )
+
+    permissions = result.stdout.lower()
+    return (
+        "access control disabled" in permissions
+        or "si:localuser:root" in permissions
+        or "localuser:root" in permissions
+        or "\nlocal:" in permissions
+    )
+
+
+def grant_root_display_access():
+    if DRY:
+        step("Would temporarily grant root access to the X11/XWayland display")
+        run(["xhost", "+si:localuser:root"], check=False)
+        return True
+    if os.geteuid() == 0:
+        die("Run this script as your regular desktop user, without sudo.")
+    if not os.environ.get("DISPLAY"):
+        die(
+            "No X11/XWayland DISPLAY is available. Start the script from a "
+            "terminal inside your graphical desktop session."
+        )
+    if not shutil.which("xhost"):
+        die("xhost is required to open the graphical installer as root.")
+    if root_display_is_authorized():
+        info("Root already has access to the X11/XWayland display.")
+        return False
+
+    step("Temporarily granting root access to the X11/XWayland display")
+    result = run(["xhost", "+si:localuser:root"], check=False)
+    if result.returncode != 0:
+        die("Could not grant root access to the X11/XWayland display.")
+    return True
+
+
+def revoke_root_display_access():
+    step("Revoking temporary root display access")
+    result = run(["xhost", "-si:localuser:root"], check=False)
+    if result.returncode != 0:
+        warn("Could not revoke root display access; run: xhost -si:localuser:root")
 
 
 def install_without_fuse(runfile):
@@ -455,10 +542,15 @@ def install_resolve(runfile, no_fuse=False):
 
     action = "Would run" if DRY else "Running"
     step(f"{action} the official installer with SKIP_PACKAGE_CHECK=1")
-    if extract_and_run:
-        install_without_fuse(runfile)
-    else:
-        run(installer_command(runfile))
+    display_granted = grant_root_display_access()
+    try:
+        if extract_and_run:
+            install_without_fuse(runfile)
+        else:
+            run(installer_command(runfile))
+    finally:
+        if display_granted:
+            revoke_root_display_access()
     ok("Installation previewed." if DRY else "Installer finished.")
 
 
