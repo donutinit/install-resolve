@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import os
 import shlex
 import shutil
@@ -101,6 +102,7 @@ APT_GROUPS = [
     ["libapr1t64", "libapr1"],
     ["libaprutil1t64", "libaprutil1"],
     ["libasound2t64", "libasound2"],
+    ["libfuse2t64", "libfuse2"],
     ["libglib2.0-0t64", "libglib2.0-0"],
 ]
 
@@ -118,6 +120,8 @@ DNF_PKGS = [
     "apr",
     "apr-util",
     "alsa-lib",
+    "fuse",
+    "fuse-libs",
     "glib2",
     "libxcrypt-compat",
     "libxcb",
@@ -133,6 +137,7 @@ DNF_PKGS = [
 PACMAN_PKGS = [
     "apr-util",
     "alsa-lib",
+    "fuse2",
     "glib2",
     "libxcrypt-compat",
     "libxcb",
@@ -158,12 +163,12 @@ def sudo():
     return ["sudo"]
 
 
-def run(cmd, check=True, env=None):
+def run(cmd, check=True, env=None, cwd=None):
     print("│    " + paint("$ " + " ".join(q(c) for c in cmd), C.DIM, C.GRAY))
     if DRY:
         return subprocess.CompletedProcess(cmd, 0)
     try:
-        return subprocess.run(cmd, check=check, env=env)
+        return subprocess.run(cmd, check=check, env=env, cwd=cwd)
     except FileNotFoundError:
         die(f"Command not found: {cmd[0]}")
     except subprocess.CalledProcessError as exc:
@@ -392,11 +397,65 @@ def get_runfile(build):
     return build
 
 
-def install_resolve(runfile):
+def fuse2_ready():
+    fuse_device = Path("/dev/fuse")
+    if not fuse_device.exists() or not os.access(fuse_device, os.R_OK | os.W_OK):
+        return False
+    if not shutil.which("fusermount") and not shutil.which("fusermount3"):
+        return False
+    try:
+        ctypes.CDLL("libfuse.so.2")
+    except OSError:
+        return False
+    return True
+
+
+def installer_command(runfile):
+    return sudo() + [
+        "env",
+        "SKIP_PACKAGE_CHECK=1",
+        str(runfile),
+        "-i",
+    ]
+
+
+def install_without_fuse(runfile):
+    if DRY:
+        target = Path(tempfile.gettempdir()) / ".davinci-resolve-appimage-extract"
+        step(f"Would extract the AppImage into: {target}")
+        run([str(runfile), "--appimage-extract"], cwd=target)
+        run(installer_command(target / "squashfs-root" / "AppRun"))
+        return
+
+    with tempfile.TemporaryDirectory(
+        prefix=".davinci-resolve-appimage-extract-"
+    ) as temp_dir:
+        target = Path(temp_dir)
+        step(f"Extracting the AppImage into: {target}")
+        run([str(runfile), "--appimage-extract"], cwd=target)
+
+        app_run = target / "squashfs-root" / "AppRun"
+        if not app_run.is_file():
+            die("AppImage extraction finished without creating squashfs-root/AppRun.")
+
+        app_run.chmod(app_run.stat().st_mode | stat.S_IXUSR)
+        run(installer_command(app_run))
+
+
+def install_resolve(runfile, no_fuse=False):
     section(f"Installing {product_name(runfile.name)}")
+    extract_and_run = no_fuse or not fuse2_ready()
+    if extract_and_run:
+        warn("FUSE 2 is unavailable or bypassed; using AppImage extract-and-run.")
+    else:
+        info("FUSE 2 runtime: ready")
+
     action = "Would run" if DRY else "Running"
     step(f"{action} the official installer with SKIP_PACKAGE_CHECK=1")
-    run(sudo() + ["env", "SKIP_PACKAGE_CHECK=1", str(runfile), "-i"])
+    if extract_and_run:
+        install_without_fuse(runfile)
+    else:
+        run(installer_command(runfile))
     ok("Installation previewed." if DRY else "Installer finished.")
 
 
@@ -537,6 +596,11 @@ def main():
     parser.add_argument("--no-clean", action="store_true",
                         help="Do not move Resolve downloads to Trash.")
     parser.add_argument(
+        "--no-fuse",
+        action="store_true",
+        help="Run the AppImage through its extraction fallback instead of FUSE.",
+    )
+    parser.add_argument(
         "--search",
         action="append",
         help="Directory to search. May be specified more than once.",
@@ -562,7 +626,7 @@ def main():
     runfile = get_runfile(build)
 
     if not args.skip_install:
-        install_resolve(runfile)
+        install_resolve(runfile, no_fuse=args.no_fuse)
 
     if not args.skip_lib_fix:
         fix_old_libs()

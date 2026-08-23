@@ -18,6 +18,7 @@ installation, compatibility cleanup, and a quick GPU/OpenCL check.
 ├─ Dependencies
 │    Package manager: dnf
 │  ✓ apr
+│  ✓ fuse-libs
 │  ✓ glib2
 │  ✓ clinfo
 │  ✓ All dependencies are installed.
@@ -34,14 +35,15 @@ installation, compatibility cleanup, and a quick GPU/OpenCL check.
 ## What it does
 
 1. Detects `apt`, `dnf`, or `pacman`.
-2. Checks the required runtime, XCB, audio, and OpenCL packages.
+2. Checks the required FUSE 2, runtime, XCB, audio, and OpenCL packages.
 3. Asks before installing any missing dependencies with elevated privileges.
 4. Recursively finds the newest Resolve `.zip` or `.run` in `~/Downloads`.
 5. Detects whether the build is Resolve Free or Resolve Studio.
 6. Extracts the `.run`, makes it executable, and starts the official installer.
-7. Moves incompatible bundled glib libraries into a timestamped backup.
-8. Moves downloaded installers and extraction folders to Trash.
-9. Prints a compact NVIDIA and OpenCL report.
+7. Falls back to extracting the AppImage when FUSE cannot mount it.
+8. Moves incompatible bundled glib libraries into a timestamped backup.
+9. Moves downloaded installers and extraction folders to Trash.
+10. Prints a compact NVIDIA and OpenCL report.
 
 The script does **not** download or redistribute DaVinci Resolve. Download the
 Linux installer directly from Blackmagic Design, then place it in
@@ -99,6 +101,7 @@ NO_COLOR=1 ./install-resolve --dry-run
 | `--skip-install` | Extract or prepare the installer without launching it. |
 | `--skip-lib-fix` | Leave Resolve's bundled glib libraries untouched. |
 | `--no-clean` | Keep downloaded installers and extraction directories. |
+| `--no-fuse` | Extract the AppImage and run `AppRun` without mounting FUSE. |
 | `--color auto\|always\|never` | Control ANSI color output. |
 
 Examples:
@@ -112,20 +115,24 @@ Examples:
 
 # Run the official installer without dependency or glib handling
 ./install-resolve --skip-deps --skip-lib-fix
+
+# Bypass FUSE and use the AppImage extraction fallback
+./install-resolve --no-fuse
 ```
 
 ## Supported systems
 
-| Package manager | Distribution family | Dependency command |
-| --- | --- | --- |
-| `apt` | Debian, Ubuntu, and derivatives | `apt-get install` |
-| `dnf` | Fedora and derivatives | `dnf install` |
-| `pacman` | Arch Linux and derivatives | `pacman -S --needed` |
+| Package manager | Distribution family | FUSE 2 package | Dependency command |
+| --- | --- | --- | --- |
+| `apt` | Debian, Ubuntu, and derivatives | `libfuse2t64` or `libfuse2` | `apt-get install` |
+| `dnf` | Fedora and derivatives | `fuse` + `fuse-libs` | `dnf install` |
+| `pacman` | Arch Linux and derivatives | `fuse2` | `pacman -S --needed` |
 
 Requirements:
 
 - Linux and Python 3.8 or newer
 - `sudo`, unless running as root
+- FUSE 2 for the normal AppImage path; the script installs it when available
 - `gio`, `trash-put`, or `trash` for safe download cleanup
 - An official Linux build of Resolve Free or Resolve Studio
 
@@ -136,6 +143,8 @@ No third-party Python packages are required.
 - Missing system packages are installed only after an explicit `[y/N]` prompt.
 - The official Blackmagic Design installer remains interactive.
 - The script passes `SKIP_PACKAGE_CHECK=1` only after handling dependencies itself.
+- When FUSE is unavailable, the fallback extracts into a temporary directory,
+  runs `squashfs-root/AppRun`, and removes the temporary files afterward.
 - Bundled glib files are moved, never deleted, to
   `/opt/resolve/libs/disabled-by-auto-installer-<timestamp>`.
 - Downloads are sent to Trash when a supported trash command is available.
@@ -162,6 +171,21 @@ Check that its filename contains both `DaVinci` and `Resolve` and ends in
 
 The archive must contain a Resolve `.run` installer. Re-download incomplete or
 damaged archives from Blackmagic Design.
+
+**`AppImages require FUSE to run`**
+
+The normal run checks and installs the correct FUSE 2 package for the detected
+distribution. If FUSE is installed but mounting is blocked by a container,
+atomic desktop, or another system restriction, bypass it explicitly:
+
+```bash
+./install-resolve --no-fuse
+```
+
+This uses the AppImage's built-in `--appimage-extract` mode and runs its
+`squashfs-root/AppRun` entry point. See the
+[official AppImage FUSE troubleshooting guide](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
+for additional background.
 
 **Resolve cannot see the GPU**
 
