@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+DRY = False
+COLOR = False
+
+# ─────────────────────────────── Estilo / color ───────────────────────────────
+
+def _color_on(mode):
+    if mode == "always":
+        return True
+    if mode == "never" or "NO_COLOR" in os.environ:
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITAL = "\033[3m"
+    AMBER = "\033[38;5;214m"
+    CYAN = "\033[38;5;51m"
+    GREEN = "\033[38;5;42m"
+    RED = "\033[38;5;203m"
+    YELLOW = "\033[38;5;220m"
+    GRAY = "\033[38;5;244m"
+    MAG = "\033[38;5;177m"
+    WHITE = "\033[38;5;255m"
+
+
+def paint(text, *codes):
+    if not COLOR:
+        return text
+    return "".join(codes) + text + C.RESET
+
+
+def banner(search_dirs):
+    mode = "Vista previa" if DRY else "Instalación"
+    locations = ", ".join(str(Path(d).expanduser()) for d in search_dirs)
+
+    print()
+    print(paint("╭─ DaVinci Resolve Studio installer", C.BOLD, C.CYAN))
+    print(f"│ {paint('Buscar en'.ljust(13), C.DIM)} {locations}")
+    print(f"│ {paint('Modo'.ljust(13), C.DIM)} {paint(mode, C.BOLD, C.AMBER if DRY else C.GREEN)}")
+
+
+def section(title):
+    print(paint(f"├─ {title}", C.BOLD, C.MAG))
+
+
+def step(msg):
+    print("│  " + paint("›", C.CYAN) + f" {msg}")
+
+
+def ok(msg):
+    print("│  " + paint("✓", C.GREEN) + f" {msg}")
+
+
+def info(msg):
+    print("│    " + paint(msg, C.DIM, C.GRAY))
+
+
+def warn(msg):
+    sys.stdout.flush()
+    print("│  " + paint("!", C.YELLOW) + " " + paint(msg, C.YELLOW), file=sys.stderr)
+
+
+def die(msg):
+    sys.stdout.flush()
+    print(paint("╰─ ! ", C.BOLD, C.RED) + paint(msg, C.BOLD, C.RED), file=sys.stderr)
+    sys.exit(1)
+
+
+def success_box(msg):
+    print(paint(f"╰─ ✓ {msg}", C.BOLD, C.GREEN))
+
+
+# ─────────────────────────────── Paquetes ───────────────────────────────
+
+LIB_PATTERNS = [
+    "libglib-2.0.so*",
+    "libgio-2.0.so*",
+    "libgmodule-2.0.so*",
+    "libgobject-2.0.so*",
+]
+
+APT_GROUPS = [
+    ["libapr1t64", "libapr1"],
+    ["libaprutil1t64", "libaprutil1"],
+    ["libasound2t64", "libasound2"],
+    ["libglib2.0-0t64", "libglib2.0-0"],
+]
+
+APT_FIXED = [
+    "libxcb-composite0",
+    "libxcb-cursor0",
+    "libxcb-damage0",
+    "libxcb-xinerama0",
+    "libxcb-xinput0",
+    "ocl-icd-opencl-dev",
+    "clinfo",
+]
+
+DNF_PKGS = [
+    "apr",
+    "apr-util",
+    "alsa-lib",
+    "glib2",
+    "libxcrypt-compat",
+    "libxcb",
+    "xcb-util-cursor",
+    "xcb-util-image",
+    "xcb-util-keysyms",
+    "xcb-util-renderutil",
+    "xcb-util-wm",
+    "ocl-icd",
+    "clinfo",
+]
+
+PACMAN_PKGS = [
+    "apr-util",
+    "alsa-lib",
+    "glib2",
+    "libxcrypt-compat",
+    "libxcb",
+    "xcb-util-cursor",
+    "xcb-util-image",
+    "xcb-util-keysyms",
+    "xcb-util-renderutil",
+    "xcb-util-wm",
+    "opencl-icd-loader",
+    "clinfo",
+]
+
+
+def q(x):
+    return shlex.quote(str(x))
+
+
+def sudo():
+    if os.geteuid() == 0:
+        return []
+    if not shutil.which("sudo"):
+        die("Necesito sudo o ejecutar como root.")
+    return ["sudo"]
+
+
+def run(cmd, check=True, env=None):
+    print("│    " + paint("$ " + " ".join(q(c) for c in cmd), C.DIM, C.GRAY))
+    if DRY:
+        return subprocess.CompletedProcess(cmd, 0)
+    return subprocess.run(cmd, check=check, env=env)
+
+
+def out(cmd):
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        return None
+
+
+def detect_pm():
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("pacman"):
+        return "pacman"
+    return None
+
+
+def apt_pkg_available(pkg):
+    r = out(["apt-cache", "show", pkg])
+    return bool(r and r.returncode == 0 and r.stdout.strip())
+
+
+def pkg_installed(pm, pkg):
+    if pm == "apt":
+        r = out(["dpkg-query", "-W", "-f=${Status}", pkg])
+        return bool(r and r.returncode == 0 and "install ok installed" in r.stdout)
+    if pm == "dnf":
+        r = out(["rpm", "-q", pkg])
+        return bool(r and r.returncode == 0)
+    if pm == "pacman":
+        r = out(["pacman", "-Q", pkg])
+        return bool(r and r.returncode == 0)
+    return False
+
+
+def resolve_apt_pkgs():
+    pkgs = []
+    for group in APT_GROUPS:
+        chosen = None
+        for p in group:
+            if apt_pkg_available(p):
+                chosen = p
+                break
+        if chosen:
+            pkgs.append(chosen)
+        else:
+            warn(f"No encontré candidato apt para: {group}")
+    pkgs += [p for p in APT_FIXED if apt_pkg_available(p)]
+    return pkgs
+
+
+def report_deps():
+    section("Dependencias")
+    pm = detect_pm()
+    if not pm:
+        warn("Package manager no soportado. No puedo revisar deps.")
+        return
+
+    info(f"Package manager detectado: {paint(pm, C.BOLD, C.CYAN)}")
+
+    if pm == "apt":
+        pkgs = resolve_apt_pkgs()
+    elif pm == "dnf":
+        pkgs = DNF_PKGS
+    elif pm == "pacman":
+        pkgs = PACMAN_PKGS
+    else:
+        pkgs = []
+
+    missing = [p for p in pkgs if not pkg_installed(pm, p)]
+
+    for p in pkgs:
+        if p in missing:
+            print("│  " + paint("✗", C.RED) + f" {p}" + paint("  (falta)", C.DIM, C.RED))
+        else:
+            print("│  " + paint("✓", C.GREEN) + " " + paint(p, C.GRAY))
+
+    if not missing:
+        ok("Todo en orden. No falta ninguna dependencia.")
+        return
+
+    warn(f"Faltan {len(missing)} paquete(s). NO los instalo — hazlo tú si quieres:")
+    if pm == "apt":
+        cmd = "sudo apt-get install " + " ".join(missing)
+    elif pm == "dnf":
+        cmd = "sudo dnf install " + " ".join(missing)
+    elif pm == "pacman":
+        cmd = "sudo pacman -S --needed " + " ".join(missing)
+    else:
+        cmd = ""
+    print("│    " + paint(cmd, C.BOLD, C.AMBER))
+
+
+def is_studio(name):
+    name = name.lower()
+    return "davinci" in name and "resolve" in name and "studio" in name
+
+
+def is_extract_name(name):
+    n = name.lower()
+    return "davinci-resolve" in n and "-extract-" in n
+
+
+def is_extract_path(p):
+    return any(is_extract_name(part) for part in Path(p).parts)
+
+
+def build_candidates(search_dirs):
+    hits = []
+    for d in search_dirs:
+        d = Path(d).expanduser().resolve()
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if is_extract_path(p):
+                continue
+            if not p.is_file():
+                continue
+            if is_studio(p.name) and p.suffix.lower() in (".zip", ".run"):
+                hits.append(p)
+    return sorted(hits, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def find_latest_build(search_dirs):
+    section("Buscando build")
+    hits = build_candidates(search_dirs)
+    if not hits:
+        locations = ", ".join(str(Path(d).expanduser()) for d in search_dirs)
+        die(f"No encontré un .zip/.run de DaVinci Resolve Studio en: {locations}")
+    if len(hits) > 1:
+        info(f"{len(hits)} builds encontrados; usaré el más reciente.")
+    ok(f"Build: {paint(hits[0].name, C.BOLD, C.WHITE)}")
+    info(f"Origen: {hits[0].parent}")
+    return hits[0]
+
+
+EXTRACT_PREFIX = ".davinci-resolve-studio-extract-"
+
+
+def extract_zip(zip_path):
+    try:
+        archive = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile:
+        die(f"El archivo no es un ZIP válido: {zip_path.name}")
+
+    with archive:
+        members = [
+            item for item in archive.infolist()
+            if not item.is_dir()
+            and Path(item.filename).suffix.lower() == ".run"
+            and is_studio(Path(item.filename).name)
+        ]
+
+        if not members:
+            die("El ZIP no contiene un .run de DaVinci Resolve Studio.")
+
+        member = sorted(members, key=lambda item: item.date_time, reverse=True)[0]
+
+        if DRY:
+            step(f"Se extraería: {Path(member.filename).name}")
+            return zip_path.parent / EXTRACT_PREFIX / member.filename
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = Path(tempfile.mkdtemp(
+            prefix=f"{EXTRACT_PREFIX}{stamp}-",
+            dir=str(zip_path.parent)
+        ))
+
+        step(f"Extrayendo ZIP en: {target.name}")
+        archive.extractall(target)
+
+    runs = [p for p in target.rglob("*.run") if is_studio(p.name)]
+
+    runfile = sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+    runfile.chmod(runfile.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    ok(f"Installer extraído: {runfile.name}")
+    return runfile
+
+
+def get_runfile(build):
+    if build.suffix.lower() == ".zip":
+        return extract_zip(build)
+
+    if not DRY:
+        build.chmod(build.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return build
+
+
+def install_resolve(runfile):
+    section("Instalando Resolve Studio")
+    action = "Se ejecutaría" if DRY else "Ejecutando"
+    step(f"{action} el installer con SKIP_PACKAGE_CHECK=1")
+    run(sudo() + ["env", "SKIP_PACKAGE_CHECK=1", str(runfile), "-i"])
+    ok("Instalación prevista." if DRY else "Installer finalizado.")
+
+
+def fix_old_libs():
+    section("Fix de libs glib viejas")
+    libs = Path("/opt/resolve/libs")
+    if not libs.exists():
+        warn("/opt/resolve/libs no existe. Saltando lib fix.")
+        return
+
+    files = []
+    for pattern in LIB_PATTERNS:
+        files.extend(libs.glob(pattern))
+
+    files = sorted(set(p for p in files if p.is_file() or p.is_symlink()))
+
+    if not files:
+        ok("No hay libs viejas que mover.")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = libs / f"disabled-by-auto-installer-{stamp}"
+
+    run(sudo() + ["mkdir", "-p", str(backup)])
+
+    for f in files:
+        run(sudo() + ["mv", "-n", str(f), str(backup) + "/"])
+
+    action = "se moverían" if DRY else "movidas"
+    ok(f"{len(files)} lib(s) {action} a: {backup.name}")
+
+
+def trash_cmd():
+    if shutil.which("gio"):
+        return ["gio", "trash"]
+    if shutil.which("trash-put"):
+        return ["trash-put"]
+    if shutil.which("trash"):
+        return ["trash"]
+    return None
+
+
+def cleanup_downloads(search_dirs):
+    section("Limpieza → Papelera")
+    tcmd = trash_cmd()
+    if not tcmd:
+        warn("No encontré 'gio' ni 'trash-put'. No muevo nada a la papelera.")
+        info("Instala trash-cli (o borra a mano los archivos de Resolve en Downloads).")
+        return
+
+    targets = []
+    seen = set()
+    for d in search_dirs:
+        d = Path(d).expanduser().resolve()
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if is_extract_path(p):
+                continue
+            if p.is_file() and is_studio(p.name) and p.suffix.lower() in (".zip", ".run"):
+                if p not in seen:
+                    seen.add(p)
+                    targets.append(p)
+        for p in d.rglob("*"):
+            if p.is_dir() and is_extract_name(p.name) and p not in seen:
+                seen.add(p)
+                targets.append(p)
+
+    if not targets:
+        ok("Nada que limpiar en Downloads.")
+        return
+
+    for p in targets:
+        step(f"A la papelera: {paint(p.name, C.WHITE)}")
+        run(tcmd + [str(p)], check=False)
+    action = "se enviarían" if DRY else "enviados"
+    ok(f"{len(targets)} elemento(s) {action} a la papelera.")
+
+
+def gpu_check():
+    section("GPU / OpenCL")
+
+    if shutil.which("nvidia-smi"):
+        r = out([
+            "nvidia-smi",
+            "--query-gpu=name,driver_version",
+            "--format=csv,noheader",
+        ])
+        if r and r.returncode == 0 and r.stdout.strip():
+            for line in r.stdout.splitlines():
+                info(f"NVIDIA: {line.strip()}")
+        else:
+            warn("nvidia-smi no pudo consultar la GPU.")
+    else:
+        warn("nvidia-smi no encontrado. OK si usas AMD/Intel.")
+
+    if shutil.which("clinfo"):
+        try:
+            r = subprocess.run(
+                ["clinfo"],
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+            lines = list(dict.fromkeys(
+                l for l in r.stdout.splitlines()
+                if "Platform Name" in l or "Device Name" in l
+            ))[:20]
+            if lines:
+                for l in lines:
+                    info(l.strip())
+            else:
+                warn("clinfo: sin platform/device visible")
+        except subprocess.TimeoutExpired:
+            warn("clinfo tardó demasiado.")
+    else:
+        warn("clinfo no encontrado.")
+
+
+def main():
+    global COLOR, DRY
+
+    parser = argparse.ArgumentParser(
+        description="Instalador de DaVinci Resolve Studio (solo Studio, desde ~/Downloads)."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Mostrar lo que se haría sin modificar archivos.",
+    )
+    parser.add_argument("--skip-deps", action="store_true",
+                        help="No revisar dependencias del sistema.")
+    parser.add_argument("--skip-install", action="store_true",
+                        help="Preparar el instalador sin ejecutarlo.")
+    parser.add_argument("--skip-lib-fix", action="store_true",
+                        help="No respaldar las librerías glib incompatibles.")
+    parser.add_argument("--no-clean", action="store_true",
+                        help="No mover los archivos de Resolve en Downloads a la papelera.")
+    parser.add_argument(
+        "--search",
+        action="append",
+        help="Directorio a buscar. Se puede repetir.",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Controlar el color de la salida (default: auto).",
+    )
+
+    args = parser.parse_args()
+    DRY = args.dry_run
+    COLOR = _color_on(args.color)
+
+    search_dirs = args.search or ["~/Downloads"]
+    banner(search_dirs)
+
+    if not args.skip_deps:
+        report_deps()
+
+    build = find_latest_build(search_dirs)
+    runfile = get_runfile(build)
+
+    if not args.skip_install:
+        install_resolve(runfile)
+
+    if not args.skip_lib_fix:
+        fix_old_libs()
+
+    if not args.no_clean and not args.skip_install:
+        cleanup_downloads(search_dirs)
+    elif args.no_clean:
+        info("Limpieza omitida (--no-clean).")
+
+    gpu_check()
+
+    if DRY:
+        result = "Vista previa completa — no se modificó nada."
+    elif args.skip_install:
+        result = f"Installer preparado: {runfile}"
+    else:
+        result = "LISTO · lanza con /opt/resolve/bin/resolve"
+    success_box(result)
+
+
+if __name__ == "__main__":
+    main()
